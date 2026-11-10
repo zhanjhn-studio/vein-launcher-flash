@@ -1,0 +1,26 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.so
+build/
+*.egg-info/
+.venv/
+venv/
+
+# ===== 运行时数据（配置 / 日志 / 下载缓存 / 实例） =====
+VeinLauncher/
+logs/
+*.log
+*.part
+*.tmp
+
+# ===== 前端依赖（dist 特意入库，方便直接运行） =====
+vein_launcher/presentation/webui/node_modules/
+
+# ===== IDE / OS =====
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+*.lnk
+*.orig
