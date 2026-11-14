@@ -4,25 +4,22 @@ from __future__ import annotations
 
 import ctypes
 import faulthandler
+import json
 import logging
 import os
 import sys
 import time
 from pathlib import Path
 
-
 def _enable_dpi_awareness() -> None:
     """必须在导入 PySide6 / 创建任何窗口之前调用。
 
-    否则进程会被 Windows 当作 DPI 不感知：
-      1. 系统用位图缩放把整个界面放大（150% 下界面变大 1.5 倍、右侧被裁）；
-      2. 该进程的窗口出现时，DWM 要切换这块屏幕的缩放上下文，
-         桌面上几乎所有窗口都会闪一下（本次要修的现象）。
+    否则进程会被 Windows 当作 DPI 不感知：150% 缩放下由 DWM 位图放大（界面变大 1.5 倍、
+    右侧被裁），且该窗口出现时要切换桌面缩放上下文，桌面所有窗口会闪一下。
     """
     if sys.platform != "win32":
         return
-    # PER_MONITOR_AWARE_V2 = -4（Win10 1703+），Qt6 默认也是这个
-    try:
+    try:  # PER_MONITOR_AWARE_V2 = -4（Win10 1703+）
         if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
             return
     except (AttributeError, OSError):
@@ -40,7 +37,7 @@ def _enable_dpi_awareness() -> None:
 
 _enable_dpi_awareness()
 
-from PySide6.QtCore import QPoint, Qt, QTimer, QUrl  # noqa: E402
+from PySide6.QtCore import QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
@@ -50,6 +47,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QSizeGrip,
     QToolButton,
     QVBoxLayout,
@@ -74,6 +72,24 @@ def _resources_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
     return Path(__file__).resolve().parents[2]
+
+
+def _ensure_bundled_agent() -> None:
+    """打包版：把 resources/agent/*.jar 复制到 <数据目录>/agent/（首次或缺失时）"""
+    try:
+        bundled = _resources_dir() / "agent"
+        if not bundled.is_dir():
+            return
+        from vein_launcher.common.utils.path_utils import get_root_dir
+
+        target = get_root_dir() / "agent"
+        target.mkdir(parents=True, exist_ok=True)
+        for jar in bundled.glob("vein-agent-*.jar"):
+            dest = target / jar.name
+            if not dest.is_file() or dest.stat().st_size != jar.stat().st_size:
+                dest.write_bytes(jar.read_bytes())
+    except Exception:
+        logger.debug("复制随包 agent 失败", exc_info=True)
 
 
 def _webui_dir() -> Path:
@@ -141,7 +157,7 @@ class TitleBar(QWidget):
         icon_path = _resources_dir() / "assets" / "logo.png"
         if icon_path.is_file():
             logo.setPixmap(QIcon(str(icon_path)).pixmap(20, 20))
-        title = QLabel(f"Vein Launcher {VERSION}", self)
+        title = QLabel(f"Vein Launcher-flash v{VERSION}", self)
         title.setStyleSheet("color:#e6e9f0; font-size:12.5px; font-weight:600;")
         layout.addWidget(logo)
         layout.addSpacing(8)
@@ -193,7 +209,14 @@ class MainWindow(QMainWindow):
         started = time.perf_counter()
         self._ctx = context
 
-        self.setWindowTitle(f"Vein Launcher {VERSION}")
+        self.setWindowTitle(f"Vein Launcher-flash v{VERSION}")
+        import queue as _queue
+
+        self._hotkey_results: "_queue.Queue" = _queue.Queue()
+        self._palette_results: "_queue.Queue" = _queue.Queue()
+        self._hotkey_timer = QTimer(self)
+        self._hotkey_timer.timeout.connect(self._drain_hotkey_results)
+        self._hotkey_timer.start(120)
         # 窗口尺寸不能超过可用屏幕（否则底部/右侧会被裁掉，150% 缩放下尤其明显）
         screen = QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else None
@@ -241,6 +264,7 @@ class MainWindow(QMainWindow):
         self.palette = CommandPalette()
         self.palette.set_source(lambda: (self.bridge.palette_entries, self.bridge.palette_nodes))
         self.palette.picked.connect(self._on_palette_picked)
+        self.palette.send_requested.connect(self._on_palette_send)
         self.hotkeys.set_palette_callback(self.palette.open_palette)
         self.hotkeys.enable_palette()
 
@@ -339,23 +363,115 @@ class MainWindow(QMainWindow):
             holder["event"].set()
 
     def _on_hotkey_fired(self, slot: int, text: str, title: str) -> None:
-        """热键按下：复制指令并提示前端"""
+        """热键按下：优先通过 MLC agent 直接发给游戏，失败再复制到剪贴板"""
+        import asyncio
+        import threading
+
+        def worker() -> None:
+            mode = "copy"
+            try:
+                command = (text or "").strip()
+                if command:
+                    payload = command if command.startswith("/") else "/" + command
+                    asyncio.run(self._ctx.mlc.agent_chat(payload))
+                    mode = "sent"
+            except Exception as exc:  # agent 不在线 / 游戏未启动 / 总开关关闭
+                message = str(exc)
+                logger.info("热键 MLC 发送失败，改用剪贴板：%s", message)
+                if "总开关" in message or "turned off" in message:
+                    mode = "copy-mlc-off"
+            self._hotkey_results.put((slot, text, title, mode))
+
+        threading.Thread(target=worker, name="vein-hotkey", daemon=True).start()
+
+    def _bind_saved_hotkeys(self) -> None:
+        """启动时把 config/tools.json 里带槽位的自定义指令绑成全局热键"""
+        try:
+            from vein_launcher.common.utils.path_utils import get_config_dir
+
+            config_path = get_config_dir() / "tools.json"
+            if not config_path.is_file():
+                return
+            data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            entries = [
+                {"slot": item.get("slot"), "text": item.get("cmd"), "title": item.get("title")}
+                for item in data.get("favorites", [])
+                if item.get("slot") is not None and item.get("cmd")
+            ]
+            if not entries:
+                return
+            result = self.hotkeys.bind(entries)
+            logger.info("启动时绑定自定义指令热键：%s", result.get("bound"))
+        except Exception:
+            logger.exception("启动时绑定指令热键失败")
+
+    def _drain_hotkey_results(self) -> None:
+        """主线程轮询：把工作线程的热键结果取回来处理"""
+        while True:
+            try:
+                slot, text, title, mode = self._hotkey_results.get_nowait()
+            except Exception:
+                return
+            self._hotkey_done(slot, text, title, mode)
+        while True:
+            try:
+                command, ok, error = self._palette_results.get_nowait()
+            except Exception:
+                return
+            self._on_palette_send_done(command, ok, error)
+
+    def _hotkey_done(self, slot: int, text: str, title: str, mode: str) -> None:
         from PySide6.QtGui import QGuiApplication
 
-        try:
-            clipboard = QGuiApplication.clipboard()
-            clipboard.setText(text)
-            readback = clipboard.text()
-        except Exception:
-            logger.exception("热键复制失败")
+        if mode == "sent":
+            logger.info("全局热键 Ctrl+Alt+%s → 已发送到游戏：%s", slot, title or text)
+        else:
+            try:
+                QGuiApplication.clipboard().setText(text)
+            except Exception:
+                logger.exception("热键复制失败")
+                return
+            logger.info("全局热键 Ctrl+Alt+%s → 已复制：%s", slot, title or text)
+        self.bridge.push_hotkey(slot, text, title, mode)
+
+    def _on_palette_send(self, command: str) -> None:
+        """速查窗按 Enter：通过 MLC agent 直接发进游戏"""
+        import asyncio
+        import threading
+
+        def worker() -> None:
+            ok = False
+            error = ""
+            try:
+                asyncio.run(self._ctx.mlc.agent_chat(command))
+                ok = True
+            except Exception as exc:  # 游戏没开 / agent 未连接
+                error = str(exc)
+            self._palette_results.put((command, ok, error))
+
+        threading.Thread(target=worker, name="vein-palette-send", daemon=True).start()
+
+    def _on_palette_send_done(self, command: str, ok: bool, error: str) -> None:
+        from PySide6.QtGui import QGuiApplication
+
+        if ok:
+            logger.info("速查窗已发送到游戏：%s", command)
             return
-        logger.info(
-            "全局热键 Ctrl+Alt+%s 触发，已复制：%s（回读=%r）",
-            slot,
-            title or text,
-            readback[:60],
-        )
-        self.bridge.push_hotkey(slot, text, title)
+        try:
+            QGuiApplication.clipboard().setText(command)
+        except Exception:
+            logger.exception("速查窗复制失败")
+        logger.info("速查窗发送失败（%s），已复制到剪贴板：%s", error, command)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("发送失败")
+        box.setText("游戏没有在运行、MLC agent 未连接，或 MLC 总开关未开启。")
+        box.setInformativeText(f"指令已自动复制到剪贴板：\n{command}")
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        box.open()
+        QTimer.singleShot(8000, box.close)
 
     def _on_palette_picked(self, command: str) -> None:
         """速查窗里选中并复制了一条指令"""
@@ -434,6 +550,7 @@ def _schedule_auto_exit(app: QApplication) -> None:
 
 def main() -> int:
     _hide_console()
+    _ensure_bundled_agent()
     logger_root = setup_logger()
     _crash_handle = _enable_crash_handler(logger_root)
     install_excepthook(logger_root)
@@ -472,6 +589,7 @@ def main() -> int:
     if icon.is_file():
         window.setWindowIcon(QIcon(str(icon)))
     window.show()
+    QTimer.singleShot(1500, window._bind_saved_hotkeys)
     # 窗口真正显示后句柄才稳定，这里再注册一次 Ctrl+Alt+Q
     try:
         window.hotkeys.enable_palette()

@@ -20,6 +20,7 @@ from vein_launcher.common.exceptions import VeinError
 from vein_launcher.common.utils.path_utils import ensure_dir, get_version_dir
 from vein_launcher.infrastructure.network.http_client import HttpClient, HttpClientError
 from vein_launcher.infrastructure.process.java_detector import JavaDetector
+from vein_launcher.common.utils.console import hidden_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +53,14 @@ class LoaderService:
 
     # ------------------------------------------------------------------
     async def install(
-        self, loader: str, mc_version: str, loader_version: Optional[str] = None
+        self, loader: str, mc_version: str, loader_version: Optional[str] = None, progress=None
     ) -> Dict[str, Any]:
         loader = loader.lower()
         if loader not in LOADERS:
             raise VeinError(f"不支持的加载器：{loader}")
 
         # 先确保原版本体已安装
-        await self._versions.install(mc_version)
+        await self._versions.install(mc_version, progress=progress)
 
         if loader in ("fabric", "quilt"):
             return await self._install_meta_loader(loader, mc_version, loader_version)
@@ -128,6 +129,7 @@ class LoaderService:
             cwd=str(work),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **hidden_kwargs(),
         )
         out, _ = await proc.communicate()
         log = out.decode("utf-8", errors="replace")

@@ -22,6 +22,7 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from vein_launcher.common.events.event_bus import event_bus
 from vein_launcher.common.events.events import EventNames
+from vein_launcher.common.utils.console import hidden_kwargs, hidden_popen_kwargs
 from vein_launcher.presentation.context import AppContext
 
 logger = logging.getLogger(__name__)
@@ -158,11 +159,13 @@ class ApiBridge(QObject):
             "accounts.select": self._accounts_select,
             "mods.search": self._mods_search,
             "mods.featured": self._mods_featured,
+            "mods.versions": self._mods_versions,
             "mods.install": self._mods_install,
             "java.detect": self._java_detect,
             "java.ensure": self._java_ensure,
             "java.resolve": self._java_resolve,
             "downloads.list": self._downloads_list,
+            "downloads.remove": self._downloads_remove,
             "mlc.worlds": self._mlc_worlds,
             "app.openDataDir": self._open_data_dir,
             "i18n.get": self._i18n_get,
@@ -222,6 +225,8 @@ class ApiBridge(QObject):
             "plugins.logs": self._plugins_logs,
             "plugins.uiAction": self._plugins_ui_action,
             "plugins.installExample": self._plugins_install_example,
+            "plugins.nodeStatus": self._plugins_node_status,
+            "plugins.installNode": self._plugins_install_node,
             "logs.openDir": self._open_log_dir,
         }
 
@@ -367,7 +372,7 @@ class ApiBridge(QObject):
         from vein_launcher.common.utils.path_utils import get_version_dir
 
         path = str(get_version_dir(str(instance)))
-        subprocess.Popen(["explorer", path])
+        subprocess.Popen(["explorer", path], **hidden_popen_kwargs())
         return {"path": path}
 
     async def _versions_install(
@@ -387,7 +392,12 @@ class ApiBridge(QObject):
             async with self._install_lock:
                 if loader:
                     result = await self._ctx.loaders.install(
-                        str(loader), str(version_id), str(loader_version) or None
+                        str(loader),
+                        str(version_id),
+                        str(loader_version) or None,
+                        progress=lambda phase, done, total: self._progress(
+                            task_id, done, total
+                        ),
                     )
                     source = result.get("version_id", f"{loader}-{version_id}")
                 else:
@@ -399,17 +409,22 @@ class ApiBridge(QObject):
                     )
                     source = str(version_id)
 
+                self._run_js("window.__veinInstalled && window.__veinInstalled()")
                 if custom_name:
                     target = await self._ctx.versions.copy_instance(source, str(custom_name))
                     result = {**result, "version_id": target, "custom": True}
                 return result
-        except Exception as exc:
+        except BaseException as exc:
             entry = self._downloads.get(task_id)
             if entry:
-                entry.update(active=False, error=str(exc))
+                message = "已取消" if isinstance(exc, asyncio.CancelledError) else str(exc)
+                entry.update(active=False, error=message)
             raise
         finally:
             entry = self._downloads.get(task_id)
+            if entry and entry.get("error") is None:
+                entry["done"] = max(int(entry.get("done") or 0), int(entry.get("total") or 1))
+                entry["total"] = entry["done"]
             if entry and entry.get("error") is None:
                 entry["active"] = False
 
@@ -481,7 +496,9 @@ class ApiBridge(QObject):
         return self._ctx.accounts.add_offline(str(username))
 
     async def _accounts_select(self, account_id: str) -> dict:
-        return {"ok": self._ctx.accounts.select(str(account_id))}
+        ok = self._ctx.accounts.select(str(account_id))
+        self._run_js("window.__veinAccountsChanged && window.__veinAccountsChanged()")
+        return {"ok": ok}
 
     async def _mods_search(self, query: str, project_type: str, mc_version: str, loader: str) -> list:
         hits = await self._ctx.modrinth.search(
@@ -502,8 +519,53 @@ class ApiBridge(QObject):
         )
         return [self._ctx.modrinth.summary(hit) for hit in hits]
 
-    async def _mods_install(self, slug: str, instance: str, project_type: str, loader: str) -> dict:
-        versions = await self._ctx.modrinth.versions(str(slug), loader=str(loader) or None)
+    async def _mods_versions(self, slug: str, mc_version: str = "", loader: str = "") -> list:
+        versions = await self._ctx.modrinth.versions(
+            str(slug), game_version=str(mc_version) or None, loader=str(loader) or None
+        )
+        rows = []
+        for item in versions:
+            file = self._ctx.modrinth.file_of(item)
+            if not file:
+                continue
+            rows.append(
+                {
+                    "id": item.get("id", ""),
+                    "name": item.get("name", ""),
+                    "version_number": item.get("version_number", ""),
+                    "game_versions": item.get("game_versions", []),
+                    "loaders": item.get("loaders", []),
+                    "date": item.get("date_published", ""),
+                    "downloads": item.get("downloads", 0),
+                    "file": file,
+                }
+            )
+        return rows
+
+    async def _mods_install(self, slug: str, instance: str, project_type: str, loader: str, version_id: str = "") -> dict:
+        import re as _re
+
+        instance_id = str(instance)
+        has_loader = any(k in instance_id.lower() for k in ("fabric", "forge", "quilt", "neoforge"))
+        if str(project_type) == "mod" and not has_loader:
+            mc_version = _re.sub(r"^(fabric|forge|quilt|neoforge)-", "", instance_id, flags=_re.I)
+            return {
+                "needsLoader": True,
+                "instance": instance_id,
+                "mcVersion": mc_version,
+                "suggestedLoader": "fabric",
+            }
+
+        instance_loader = ""
+        for key in ("fabric", "quilt", "neoforge", "forge"):
+            if key in instance_id.lower():
+                instance_loader = key
+                break
+        effective_loader = instance_loader or str(loader) or None
+        versions = await self._ctx.modrinth.versions(str(slug), loader=effective_loader)
+        if version_id:
+            picked = next((v for v in versions if str(v.get("id")) == str(version_id)), None)
+            versions = [picked] if picked else []
         if not versions:
             raise RuntimeError("没有可下载的文件")
         file = self._ctx.modrinth.file_of(versions[0])
@@ -516,17 +578,53 @@ class ApiBridge(QObject):
 
             workdir = Path(tempfile.mkdtemp(prefix="vein_pack_"))
             archive = workdir / file["name"]
+            task_id = f"pack-{slug}"
+            self._downloads[task_id] = {
+                "id": task_id, "name": str(slug), "done": 0, "total": 0, "active": True, "error": None,
+            }
             try:
-                await self._ctx.modrinth_download(file["url"], archive, file.get("sha1"))
-                return await self._ctx.modpacks.install(archive, str(instance))
+                await self._ctx.modrinth_download(
+                    file["url"], archive, file.get("sha1"),
+                    progress=lambda done, total: self._progress(task_id, done, total),
+                )
+                return await self._ctx.modpacks.install(
+                    archive,
+                    str(instance),
+                    progress=lambda done, total: self._progress(task_id, done, total),
+                )
+            except Exception as exc:
+                entry = self._downloads.get(task_id)
+                if entry:
+                    entry.update(active=False, error=str(exc))
+                raise
             finally:
+                entry = self._downloads.get(task_id)
+                if entry and entry.get("error") is None:
+                    entry.update(active=False)
                 shutil.rmtree(workdir, ignore_errors=True)
 
         target_dir = self._ctx.instance_sub_dir(str(instance), str(project_type))
         target_dir.mkdir(parents=True, exist_ok=True)
-        await self._ctx.modrinth_download(
-            file["url"], target_dir / file["name"], file.get("sha1")
-        )
+        task_id = f"mod-{slug}"
+        self._downloads[task_id] = {
+            "id": task_id,
+            "name": str(slug),
+            "done": 0,
+            "total": 0,
+            "active": True,
+            "error": None,
+        }
+        try:
+            await self._ctx.modrinth_download(
+                file["url"],
+                target_dir / file["name"],
+                file.get("sha1"),
+                progress=lambda done, total: self._progress(task_id, done, total),
+            )
+        finally:
+            entry = self._downloads.get(task_id)
+            if entry:
+                entry.update(active=False)
         return {"installed": 1, "path": str(target_dir / file["name"])}
 
     async def _java_detect(self, refresh: bool = False) -> list:
@@ -569,7 +667,9 @@ class ApiBridge(QObject):
         return await asyncio.to_thread(run)
 
     async def _game_command(self, command: str = "", pid: int = 0) -> dict:
-        """原版通道：切到游戏窗口，用键盘输入一条聊天指令"""
+        """原版通道：切到游戏窗口，用键盘输入一条聊天指令（受 MLC 总开关控制）"""
+        if not self._ctx.mlc.enabled:
+            raise RuntimeError("MLC 总开关未开启：请先到 MLC 页打开总开关（MLC is turned off）")
         from vein_launcher.infrastructure.process import game_input
 
         def run() -> dict:
@@ -587,6 +687,23 @@ class ApiBridge(QObject):
         return await asyncio.to_thread(game_registry.kill, int(pid))
 
     # ------------------------------------------------------------------
+    async def _plugins_node_status(self) -> dict:
+        return self._ctx.plugins.node_status()
+
+    async def _plugins_install_node(self) -> dict:
+        self._downloads["node-install"] = {
+            "id": "node-install", "name": "Node.js", "done": 0, "total": 0, "active": True, "error": None,
+        }
+        try:
+            result = await self._ctx.plugins.install_node(
+                progress=lambda done, total: self._progress("node-install", done, total)
+            )
+        finally:
+            entry = self._downloads.get("node-install")
+            if entry:
+                entry.update(active=False)
+        return result
+
     async def _plugins_state(self) -> dict:
         return self._ctx.plugins.state()
 
@@ -610,8 +727,14 @@ class ApiBridge(QObject):
     async def _plugins_install_example(self, name: str) -> dict:
         return self._ctx.plugins.install_example(str(name))
 
+    async def _downloads_remove(self, task_id: str) -> dict:
+        removed = self._downloads.pop(str(task_id), None)
+        return {"removed": bool(removed), "id": str(task_id)}
+
     async def _downloads_list(self) -> list:
-        return list(self._downloads.values())
+        # 只保留最近 20 条，避免长期使用后列表无限增长
+        items = list(self._downloads.values())
+        return items[-20:]
 
     async def _i18n_get(self) -> dict:
         from vein_launcher.common.i18n.translator import translator
@@ -675,6 +798,7 @@ class ApiBridge(QObject):
             cwd=str(get_minecraft_dir()),
             stdout=_asyncio.subprocess.DEVNULL,
             stderr=_asyncio.subprocess.PIPE,
+            **hidden_kwargs(),
         )
         _, err = await proc.communicate()
         logger.info("OptiFine installer exit=%s", proc.returncode)
@@ -1115,12 +1239,13 @@ class ApiBridge(QObject):
         logger.info("指令速查表已同步：%d 条候选 / %d 个前缀", len(rows), len(self.palette_nodes))
         return {"ok": True, "count": len(rows), "nodes": len(self.palette_nodes)}
 
-    def push_hotkey(self, slot: int, text: str, title: str) -> None:
-        """热键触发后通知前端弹提示"""
+    def push_hotkey(self, slot: int, text: str, title: str, mode: str = "copy") -> None:
+        """热键触发后通知前端弹提示（mode: sent / copy）"""
         self._run_js(
             "window.__veinHotkey && window.__veinHotkey("
             f"{int(slot)},{json.dumps(text, ensure_ascii=False)},"
-            f"{json.dumps(title, ensure_ascii=False)})"
+            f"{json.dumps(title, ensure_ascii=False)},"
+            f"{json.dumps(mode, ensure_ascii=False)})"
         )
 
     async def _instance_toggle(self, version_id: str, kind: str, name: str, enabled: bool) -> dict:
@@ -1302,7 +1427,7 @@ class ApiBridge(QObject):
         from vein_launcher.common.logging.logger import log_dir
 
         path = log_dir()
-        subprocess.Popen(["explorer", str(path)])
+        subprocess.Popen(["explorer", str(path)], **hidden_popen_kwargs())
         return {"path": str(path)}
 
     # ------------------------------------------------------------------

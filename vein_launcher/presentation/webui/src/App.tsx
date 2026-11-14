@@ -5,6 +5,8 @@ import { PluginsPage } from './pages';
 import { LaunchPage } from './launchPage';
 import { DownloadPage } from './downloadPage';
 import { SettingsPage } from './settingsPage';
+import { RadialMenu } from './radialMenu';
+import { PluginPage } from './pluginPage';
 import { DownloadMonitor, Toast } from './ui';
 import { PluginUiHost } from './pluginUi';
 import { initI18n, t, useI18n, currentLang } from './i18n';
@@ -15,8 +17,11 @@ import { loadPrefs, usePrefs } from './prefs';
 
 const NAV = [
   { key: 'launch', label: 'Launch', icon: 'layui-icon-play', iconImg: 'arrow.png' },
+  { key: 'skins', label: 'Skins', icon: 'layui-icon-picture', iconImg: 'writable_book.png' },
   { key: 'download', label: 'Download', icon: 'layui-icon-download-circle', iconImg: 'hopper.png' },
   { key: 'plugins', label: 'Plugins', icon: 'layui-icon-app', iconImg: 'command_block.png', star: true },
+  { key: 'mlc', label: 'MLC', icon: 'layui-icon-console', iconImg: 'chest.png' },
+  { key: 'tools', label: 'Tools', icon: 'layui-icon-util', iconImg: 'anvil.png' },
   { key: 'settings', label: 'Settings', icon: 'layui-icon-set', iconImg: 'crafting_table.png' },
 ];
 
@@ -225,17 +230,19 @@ export function App() {
         <WallpaperLayer wallpaper={prefs.wallpaper} />
       )}
       {prefs.compactMode && (
-        <button
-          type="button"
-          className={`side-handle ${sideOpen ? 'open' : ''}`}
-          aria-label={sideOpen ? 'Hide sidebar' : 'Show sidebar'}
-          title={sideOpen ? 'Hide sidebar' : 'Show sidebar'}
-          onClick={() => setSideOpen((v) => !v)}
-        >
-          <i className={`chev ${sideOpen ? 'left' : 'right'}`} />
-        </button>
+        <RadialMenu
+          items={NAV.map((n) => ({ key: n.key, label: t(n.label), iconImg: n.iconImg }))}
+          page={page}
+          onPick={(key) => setPage(key)}
+          open={sideOpen}
+          onOpenChange={setSideOpen}
+        />
       )}
-      <aside className={`side ${prefs.compactMode ? 'compact' : ''} ${sideOpen ? 'open' : ''}`}>
+      <aside
+        className={`side ${prefs.compactMode ? 'compact wheel-hidden' : ''} ${
+          sideOpen ? 'open' : ''
+        }`}
+      >
         <div className="side-brand">
           <img src="logo.png" alt="Vein" />
           <span>VEIN</span>
@@ -273,7 +280,7 @@ export function App() {
         <header className="main-head">
           <img className="head-ico" src={`icons/${current.iconImg}`} alt="" />
           <h1>{t(current.label)}</h1>
-          <span className="sub">Vein Launcher {version}</span>
+          <span className="sub">Vein Launcher-flash v{version}</span>
           <div className="spacer" />
           <span className="sub">{installed.length} instances</span>
         </header>
@@ -310,8 +317,21 @@ export function App() {
               announcements={lightNews}
             />
           )}
+          {page === 'skins' && (
+            <PluginPage
+              pluginId="skin-library"
+              title="皮肤"
+              subtitle="由插件「皮肤下载 · LittleSkin」提供"
+            />
+          )}
           {page === 'download' && (
             <DownloadPage installed={installed} onInstalled={refreshInstalled} notify={notify} />
+          )}
+          {page === 'mlc' && (
+            <PluginPage pluginId="mlc-panel" title="MLC" subtitle="由插件「MLC 面板」提供" />
+          )}
+          {page === 'tools' && (
+            <PluginPage pluginId="command-book" title="工具" subtitle="由插件「指令速查」提供" />
           )}
           {page === 'plugins' && <PluginsPage notify={notify} />}
           {page === 'settings' && <SettingsPage notify={notify} />}

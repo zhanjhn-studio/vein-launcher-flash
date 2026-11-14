@@ -103,6 +103,32 @@ function buildApi(pluginId, manifest, dataDir) {
     },
     game: {
       async launch(versionId, username = "Player") { guard("game.launch"); return callHost(pluginId, "game.launch", [versionId, username]); },
+      async running() { guard("game.state"); return callHost(pluginId, "game.running", []); },
+      async command(command, pid = 0) { guard("game.command"); return callHost(pluginId, "game.command", [String(command), Number(pid) || 0]); },
+    },
+    clipboard: {
+      async write(text) {
+        guard("system.clipboard");
+        return callHost(pluginId, "system.clipboard", [String(text)]);
+      },
+    },
+    skin: {
+      async apply(accountId, filePath, model = "classic") {
+        guard("skin.write");
+        return callHost(pluginId, "skin.apply", [String(accountId), String(filePath), String(model)]);
+      },
+    },
+    accounts: {
+      async list() {
+        guard("accounts.read");
+        return callHost(pluginId, "accounts.list", []);
+      },
+    },
+    app: {
+      async info() { guard("app.info"); return callHost(pluginId, "app.info", []); },
+    },
+    versions: {
+      async list() { guard("versions.read"); return callHost(pluginId, "versions.list", []); },
     },
     mlc: {
       async launch(versionId, username = "Player") { guard("game.launch"); return callHost(pluginId, "mlc.launch", [versionId, username], 60000); },

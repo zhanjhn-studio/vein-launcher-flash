@@ -33,7 +33,7 @@ from vein_launcher.mlc.service import MlcService
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.5.0"
+VERSION = "0.6.7"
 
 SUBDIRS = {
     "mod": "mods",
@@ -76,7 +76,9 @@ class AppContext:
         # MLC 控制层 + 插件宿主（核心特色）
         self.mlc = MlcService(self.launcher)
         self.mlc.install_bridge()
-        self.plugins = PluginService(self.mlc, self.launcher)
+        self.plugins = PluginService(
+            self.mlc, self.launcher, skins=self.skins, accounts=self.accounts
+        )
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -84,9 +86,9 @@ class AppContext:
         return get_version_dir(instance_id) / SUBDIRS.get(project_type, "mods")
 
     @staticmethod
-    async def modrinth_download(url: str, dest: Path, sha1: Optional[str]) -> None:
+    async def modrinth_download(url: str, dest: Path, sha1: Optional[str], progress=None) -> None:
         async with Downloader() as downloader:
-            await downloader.download(url, dest, sha1=sha1 or None)
+            await downloader.download(url, dest, sha1=sha1 or None, progress=progress)
 
     # ------------------------------------------------------------------
     async def startup(self) -> None:
